@@ -28,28 +28,33 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 1,
+      version: 1, // Increment version if schema changes
       onCreate: _createDB,
     );
   }
 
   Future<void> _createDB(Database db, int version) async {
     await db.execute('''
-      CREATE TABLE food_logs(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        food_name TEXT NOT NULL,
-        calories REAL NOT NULL,
-        date_time TEXT NOT NULL
-      )
-    ''');
+        CREATE TABLE food_logs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          food_name TEXT NOT NULL,
+          calories REAL NOT NULL,
+          date_time TEXT NOT NULL,
+          sugar REAL DEFAULT 0.0,
+          quantity INTEGER DEFAULT 1
+        )
+      ''');
   }
 
-  Future<int> insertFoodLog(String foodName, double calories) async {
+  Future<int> insertFoodLog(String foodName, double calories,
+      {double sugar = 0.0, int quantity = 1}) async {
     final db = await database;
     final data = {
       'food_name': foodName,
       'calories': calories,
       'date_time': DateTime.now().toIso8601String(),
+      'sugar': sugar,
+      'quantity': quantity,
     };
     return await db.insert('food_logs', data);
   }
@@ -57,6 +62,12 @@ class DatabaseHelper {
   Future<List<Map<String, dynamic>>> getFoodLogs() async {
     final db = await database;
     return await db.query('food_logs', orderBy: 'date_time DESC');
+  }
+
+  // Add a method to clear food logs
+  Future<void> clearFoodLogs() async {
+    final db = await DatabaseHelper.instance.database;
+    await db.delete('food_logs');
   }
 }
 
@@ -68,11 +79,60 @@ class CalorieTrackerScreen extends StatefulWidget {
 class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
   File? _selectedImage;
   String _detectedFood = '';
-  double _calories = 0.0;
+  double _caloriesPerUnit = 0.0;
+  double _sugarPerUnit = 0.0;
+  double _totalCalories = 0.0;
+  double _totalSugar = 0.0;
   bool _isLoading = false;
+  bool _isHighSugar = false;
   Interpreter? _interpreter;
   List<String>? _labels;
   List<Map<String, dynamic>> _foodLogs = [];
+  int _quantity = 1;
+  double _dailyTotalSugar = 0.0;
+
+  // List of high-sugar fruits
+  Set<String> highSugarFruits = {
+    'Apple',
+    'Braeburn',
+    'Crimson Snow',
+    'Golden',
+    'Granny Smith',
+    'Pink Lady',
+    'Red Delicious',
+    'Banana',
+    'Banana Lady Finger',
+    'Banana Red',
+    'Cherries',
+    'Date',
+    'Fig',
+    'Grape',
+    'Blue Grape',
+    'Pink Grape',
+    'White Grape',
+    'Kaki',
+    'Persimmon',
+    'Lychee',
+    'Mango',
+    'Mango Red',
+    'Mangostan',
+    'Mangosteen',
+    'Passion Fruit',
+    'Granadilla',
+    'Maracuja',
+    'Pear',
+    'Pear 2',
+    'Peach',
+    'Peach 2',
+    'Peach Flat',
+    'Nectarine',
+    'Nectarine Flat',
+    'Pineapple',
+    'Pineapple Mini',
+    'Plum',
+    'Pomegranate',
+    'Rambutan',
+  };
 
   @override
   void initState() {
@@ -85,26 +145,39 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
 
   Future<void> loadFoodLogs() async {
     final logs = await DatabaseHelper.instance.getFoodLogs();
+    double totalSugar =
+    logs.fold(0.0, (sum, log) => sum + (log['sugar'] ?? 0.0));
     setState(() {
       _foodLogs = logs;
+      _dailyTotalSugar = totalSugar;
     });
   }
 
   Future<void> logFood() async {
-    if (_detectedFood.isNotEmpty && _calories > 0) {
-      await DatabaseHelper.instance.insertFoodLog(_detectedFood, _calories);
-      await loadFoodLogs();
-      ScaffoldMessenger.of(this.context as BuildContext).showSnackBar(
-        SnackBar(content: Text('Food logged successfully!')),
+    if (_detectedFood.isNotEmpty && _totalCalories > 0) {
+      await DatabaseHelper.instance.insertFoodLog(
+        _detectedFood,
+        _totalCalories,
+        sugar: _totalSugar,
+        quantity: _quantity,
       );
+      await loadFoodLogs();
     }
   }
 
+  Future<void> clearFoodLogs() async {
+    if (_foodLogs.isNotEmpty) {
+      await DatabaseHelper.instance.clearFoodLogs();
+      await loadFoodLogs();
+      _dailyTotalSugar = 0;
+    }
+  }
 
   Future<void> loadModel() async {
     try {
       _interpreter = await Interpreter.fromAsset('assets/models/model.tflite');
-      final labelsFile = await rootBundle.loadString('assets/models/labels.txt');
+      final labelsFile =
+      await rootBundle.loadString('assets/models/labels.txt');
       _labels = labelsFile.split('\n');
       print("Model loaded successfully");
     } catch (e) {
@@ -112,8 +185,9 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
     }
   }
 
-  Future<double> fetchNutritionalData(String foodItem) async {
-    const String apiUrl = 'https://trackapi.nutritionix.com/v2/natural/nutrients';
+  Future<Map<String, double>> fetchNutritionalData(String foodItem) async {
+    const String apiUrl =
+        'https://trackapi.nutritionix.com/v2/natural/nutrients';
     final Map<String, String> headers = {
       'accept': 'application/json',
       'x-app-id': 'a8259e1a',
@@ -135,14 +209,16 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
 
       if (response.statusCode == 200) {
         final dynamic data = jsonDecode(response.body);
-        return data['foods'][0]['nf_calories'].toDouble();
+        double calories = data['foods'][0]['nf_calories'].toDouble();
+        double sugars = data['foods'][0]['nf_sugars'].toDouble();
+        return {'calories': calories, 'sugars': sugars};
       } else {
         print('API request failed with status code: ${response.statusCode}');
-        return 0.0;
+        return {'calories': 0.0, 'sugars': 0.0};
       }
     } catch (e) {
       print('Error fetching nutritional data: $e');
-      return 0.0;
+      return {'calories': 0.0, 'sugars': 0.0};
     }
   }
 
@@ -189,7 +265,8 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
         }
       }
 
-      var output = List.filled(1 * _labels!.length, 0.0).reshape([1, _labels!.length]);
+      var output =
+      List.filled(1 * _labels!.length, 0.0).reshape([1, _labels!.length]);
 
       _interpreter!.run(input, output);
 
@@ -203,25 +280,68 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
       }
 
       final detectedFood = _labels![maxIndex];
-      final calories = await fetchNutritionalData(detectedFood);
+      final nutritionData = await fetchNutritionalData(detectedFood);
+      final calories = nutritionData['calories']!;
+      final sugars = nutritionData['sugars']!;
+
+      bool isHighSugar = highSugarFruits.contains(detectedFood);
 
       setState(() {
         _detectedFood = detectedFood;
-        _calories = calories;
+        _caloriesPerUnit = calories;
+        _sugarPerUnit = sugars;
+        _isHighSugar = isHighSugar;
+        _quantity = 1; // Reset quantity to 1
+        calculateTotals();
       });
     } catch (e) {
       print("Error running model: $e");
       setState(() {
         _detectedFood = "Error";
-        _calories = 0.0;
+        _caloriesPerUnit = 0.0;
+        _sugarPerUnit = 0.0;
       });
     }
+  }
+
+  void calculateTotals() {
+    _totalCalories = _caloriesPerUnit * _quantity;
+    _totalSugar = _sugarPerUnit * _quantity;
   }
 
   @override
   void dispose() {
     _interpreter?.close();
     super.dispose();
+  }
+
+  // Widget to select quantity
+  Widget quantitySelector() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          'Quantity:',
+          style: TextStyle(fontSize: 18),
+        ),
+        SizedBox(width: 10),
+        DropdownButton<int>(
+          value: _quantity,
+          items: List.generate(20, (index) => index + 1)
+              .map((value) => DropdownMenuItem<int>(
+            value: value,
+            child: Text(value.toString()),
+          ))
+              .toList(),
+          onChanged: (newValue) {
+            setState(() {
+              _quantity = newValue!;
+              calculateTotals();
+            });
+          },
+        ),
+      ],
+    );
   }
 
   @override
@@ -257,10 +377,31 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
                   'Detected Food: $_detectedFood',
                   style: TextStyle(fontSize: 18),
                 ),
+                SizedBox(height: 10),
+                quantitySelector(),
+                SizedBox(height: 10),
                 Text(
-                  'Calories: ${_calories.toStringAsFixed(2)} kcal',
+                  'Calories per unit: ${_caloriesPerUnit.toStringAsFixed(2)} kcal',
+                  style: TextStyle(fontSize: 16),
+                ),
+                Text(
+                  'Sugar per unit: ${_sugarPerUnit.toStringAsFixed(2)} g',
+                  style: TextStyle(fontSize: 16),
+                ),
+                SizedBox(height: 10),
+                Text(
+                  'Total Calories: ${_totalCalories.toStringAsFixed(2)} kcal',
                   style: TextStyle(fontSize: 18, color: Colors.green),
                 ),
+                Text(
+                  'Total Sugar: ${_totalSugar.toStringAsFixed(2)} g',
+                  style: TextStyle(fontSize: 18, color: Colors.red),
+                ),
+                if (_isHighSugar)
+                  Text(
+                    'Warning: This food has high sugar content!',
+                    style: TextStyle(fontSize: 18, color: Colors.red),
+                  ),
                 SizedBox(height: 10),
                 ElevatedButton.icon(
                   onPressed: logFood,
@@ -281,8 +422,8 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
                     icon: Icon(Icons.camera_alt),
                     label: Text('Take Photo'),
                     style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 20, vertical: 10),
+                      padding:
+                      const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                     ),
                   ),
                   SizedBox(width: 20),
@@ -291,16 +432,51 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
                     icon: Icon(Icons.photo_library),
                     label: Text('Pick from Gallery'),
                     style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 20, vertical: 10),
+                      padding:
+                      const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                     ),
                   ),
                 ],
               ),
               SizedBox(height: 30),
-              Text(
-                'Food Log History',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              SugarCounter(
+                totalSugar: _dailyTotalSugar,
+                sugarThreshold: 30.0,
+                showAlertCallback: () {
+                  showDialog(
+                    context: context,
+                    builder: (BuildContext context) {
+                      return AlertDialog(
+                        title: Text('High Sugar Intake Alert!'),
+                        content: Text(
+                          'You have consumed ${_dailyTotalSugar.toStringAsFixed(2)} g of sugar, which exceeds the recommended daily limit of 30 g.',
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () {
+                              Navigator.of(context).pop();
+                            },
+                            child: Text('OK'),
+                          ),
+                        ],
+                      );
+                    },
+                  );
+                },
+              ),
+              SizedBox(height: 20),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'Food Log History',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.delete_forever, color: Colors.red),
+                    onPressed: clearFoodLogs,
+                  ),
+                ],
               ),
               SizedBox(height: 10),
               ListView.builder(
@@ -312,9 +488,9 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
                   final dateTime = DateTime.parse(log['date_time']);
                   return Card(
                     child: ListTile(
-                      title: Text(log['food_name']),
+                      title: Text('${log['food_name']}'),
                       subtitle: Text(
-                        '${log['calories'].toStringAsFixed(2)} kcal\n${dateTime.toString().substring(0, 16)}',
+                        '${log['calories'].toStringAsFixed(2)} kcal\nSugar: ${log['sugar']?.toStringAsFixed(2) ?? '0.00'} g\n${dateTime.toString().substring(0, 16)}',
                       ),
                       leading: Icon(Icons.fastfood),
                     ),
@@ -325,6 +501,43 @@ class _CalorieTrackerScreenState extends State<CalorieTrackerScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+// Separate widget to count and display total sugar
+class SugarCounter extends StatelessWidget {
+  final double totalSugar;
+  final double sugarThreshold;
+  final VoidCallback showAlertCallback;
+
+  SugarCounter({
+    required this.totalSugar,
+    required this.sugarThreshold,
+    required this.showAlertCallback,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (totalSugar > sugarThreshold) {
+        showAlertCallback();
+      }
+    });
+
+    return Column(
+      children: [
+        Text(
+          'Total Sugar Consumed: ${totalSugar.toStringAsFixed(2)} g',
+          style: TextStyle(
+              fontSize: 18, color: Colors.red, fontWeight: FontWeight.bold),
+        ),
+        if (totalSugar > sugarThreshold)
+          Text(
+            'You have exceeded the recommended sugar intake!',
+            style: TextStyle(fontSize: 18, color: Colors.red),
+          ),
+      ],
     );
   }
 }
